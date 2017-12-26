@@ -30,7 +30,6 @@ func (m *Model) Close() {
 
 //NewModel opens connection to database and returns a new model
 func NewModel(db *mgo.Database, debug bool, debugW io.Writer) (*Model, error) {
-
 	if db == nil {
 		return nil, ErrDBIsNil
 	}
@@ -39,6 +38,12 @@ func NewModel(db *mgo.Database, debug bool, debugW io.Writer) (*Model, error) {
 	} else {
 		logger = log.New(ioutil.Discard, "", 0)
 	}
+	// logger.Println("")
+	logger.Println("Ensure index of unique login is assigned", db.C(USERCOLLECTION).EnsureIndex(mgo.Index{
+		Key:    []string{"login"},
+		Name:   "Unique Login records",
+		Unique: true,
+	}) == nil)
 	return &Model{db: db}, nil
 }
 
@@ -81,6 +86,9 @@ func (m *Model) AuthUser(u *User) error {
 //CreateNewUser creates new user from login request
 func (m *Model) CreateNewUser(login, password, fName, lName string, age int) (*User, error) {
 	logger.Printf("Create user: %s %s (%s:%s), age %d", fName, lName, login, password, age)
+	if m.CheckLoginExists(login, nil) {
+		return nil, ErrLoginExists
+	}
 	return NewUser(fName, lName, login, password, age, USER, USERNEW, m.db)
 }
 
@@ -91,4 +99,12 @@ func (m *Model) CheckUserExists(login, password string, u *User) bool {
 		u = &User{Login: login, Password: encryptedPassword}
 	}
 	return u.IsExist(m.db)
+}
+
+//CheckLoginExists in db
+func (m *Model) CheckLoginExists(login string, u *User) bool {
+	if u == nil {
+		u = &User{Login: login}
+	}
+	return u.IsLoginExist(m.db)
 }

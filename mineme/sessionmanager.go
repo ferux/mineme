@@ -33,7 +33,7 @@ func NewSessionManager(db *mgo.Database, debug bool, debugW io.Writer) (*Session
 	} else {
 		smlogger = log.New(debugW, "[SessionManager] ", log.Ldate+log.Ltime)
 	}
-	sm := &SessionManager{db: db, cookieName: "sessionid", maxlifetime: int64(time.Hour * 24 * 30 / 10000)}
+	sm := &SessionManager{db: db, cookieName: "sessionid", maxlifetime: int64(3600 * 24 * 10)}
 	sm.SessionGC()
 	return sm, nil
 }
@@ -57,22 +57,22 @@ func (s *SessionManager) SessionStart(w http.ResponseWriter, r *http.Request) (*
 		logger.Printf("Can't parse session UUID: %s", cookie.Value)
 		return nil, err
 	}
-	logger.Printf("Trying to find session id [%s]", sUUID.String())
 	session := &Session{SessionID: sUUID}
 	err = session.FindByID(s.db)
 	if err == mgo.ErrNotFound {
-		logger.Println("but session not found")
+		logger.Println("Session not found")
 		session := s.assignNewSession(w, r)
 		return session, nil
+	} else if err != nil {
+		logger.Println("Can't find session. Reason:", err)
 	}
 	logger.Println("and session has been found:", session)
-
 	return session, nil
 }
 
 func (s *SessionManager) assignNewSession(w http.ResponseWriter, r *http.Request) *Session {
 	sid := s.sessionID()
-	smlogger.Printf("Created new sessionID: %s", sid.String())
+	smlogger.Printf("Created new temp sessionID: %s", sid.String())
 	sess := &Session{SessionID: sid, Lifetime: s.maxlifetime, OID: bson.NewObjectId(), Created: time.Now().Unix()}
 	cookie := &http.Cookie{
 		Name:     s.cookieName,
@@ -100,19 +100,23 @@ func (s *SessionManager) SessionEnd(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 	}
 	http.SetCookie(w, hcookie)
+	// Moved to daemon package
 	// s.db.C(SESSIONCOLLECTION).Remove(bson.M{"session_id": cookie.Value})
 }
 
 //SessionGC removes all expired sessions
 func (s *SessionManager) SessionGC() {
-	smlogger.Println("Garbage Collection started")
 	t := time.Now()
-	s.db.C(SESSIONCOLLECTION).RemoveAll(bson.M{
+	ch, _ := s.db.C(SESSIONCOLLECTION).RemoveAll(bson.M{
 		"created": bson.M{
 			"$lte": time.Now().Unix() - s.maxlifetime,
 		},
 	})
-	smlogger.Printf("Garbage Collection completed. Took %s", time.Since(t))
+	ch1, _ := s.db.C(SESSIONCOLLECTION).RemoveAll(bson.M{
+		"created": uuid.Nil.String(),
+	})
+	removed := ch.Removed + ch1.Removed
+	smlogger.Printf("Expired session cleared (%03d). Took %s", removed, time.Since(t))
 	time.AfterFunc(time.Minute*15, s.SessionGC)
 }
 

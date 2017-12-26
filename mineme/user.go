@@ -14,11 +14,22 @@ import (
 
 var _ CRUD = (*User)(nil)
 
+//USERCOLLECTION unifies name of the user collection
 const USERCOLLECTION = "users"
 
-var checkNames = regexp.MustCompile(`^[A-Za-z0-9]+(?:[ _-][A-Za-z0-9]+)*$`)
-var checkLogin = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,15}$`)
-var checkPassword = regexp.MustCompile(`^[\S]{6,15}$`)
+//Compiled regexpressions for checking user parameters
+var (
+	checkNames    = regexp.MustCompile(`^[A-Za-z0-9]+(?:[ _-][A-Za-z0-9]+)*$`)
+	checkLogin    = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,15}$`)
+	checkPassword = regexp.MustCompile(`^[\S]{6,15}$`)
+)
+
+//Errors handling
+var (
+	ErrWrongInput    = errors.New("Input is wrong")
+	ErrTooShortInput = errors.New("Input is too short")
+	ErrLoginExists   = errors.New("Login is already taken")
+)
 
 //User is a representation of User data model
 type User struct {
@@ -43,7 +54,14 @@ type User struct {
 func (u *User) String() string {
 	u.mux.Lock()
 	defer u.mux.Unlock()
-	return fmt.Sprintf("[%s] %s %s", u.ID, u.LastName, u.FirstName)
+	return fmt.Sprintf("[%s] %s %s at the age of %d", u.ID, u.LastName, u.FirstName, u.Age)
+}
+
+//MakeSafeUser creates version for public views
+func (u *User) MakeSafeUser() *SafeUserDetails {
+	s := &SafeUserDetails{}
+	s.ApplyUser(u)
+	return s
 }
 
 //Update user in db and at backend
@@ -109,12 +127,6 @@ func (u *User) FindUser(db *mgo.Database) error {
 	return db.C(USERCOLLECTION).Find(bson.M{"login": u.Login, "password": u.Password}).Limit(1).One(u)
 }
 
-//Errors handling
-var (
-	ErrWrongInput    = errors.New("Input is wrong")
-	ErrTooShortInput = errors.New("Input is too short")
-)
-
 //NewUser creates a new user
 func NewUser(FirstName, LastName, Login, Password string, Age int, Group Group, Status Status, db *mgo.Database) (*User, error) {
 	if db == nil {
@@ -164,6 +176,20 @@ func (u *User) IsExist(db *mgo.Database) bool {
 		n, err = db.C(USERCOLLECTION).Find(bson.M{"login": u.Login, "password": u.Password}).Limit(1).Count()
 	}
 
+	if err != nil || n == 0 {
+		return false
+	}
+	return true
+}
+
+//IsLoginExist checks of availability of login
+func (u *User) IsLoginExist(db *mgo.Database) bool {
+	var n int
+	var err error
+	{
+		logger.Printf("Using login to find user: %s", u.Login)
+		n, err = db.C(USERCOLLECTION).Find(bson.M{"login": u.Login}).Limit(1).Count()
+	}
 	if err != nil || n == 0 {
 		return false
 	}

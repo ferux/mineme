@@ -1,3 +1,5 @@
+//TODO: Add ability to modify user's data
+//TODO: Add profile page
 package daemon
 
 import (
@@ -13,8 +15,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"gopkg.in/mgo.v2/bson"
 
 	"github.com/google/uuid"
 
@@ -68,19 +68,20 @@ func run(laddr string, db *mgo.Database, notify <-chan os.Signal, debug bool, de
 func makeRoutes() http.Handler {
 	router := mux.NewRouter()
 	hostname, _ := os.Hostname()
-	router = router.Host(hostname).Subrouter()
+	router = router.Host(hostname).Subrouter().Headers("Content-Type", "application/json").Subrouter()
 	router.Handle("/", http.FileServer(http.Dir("./assets/")))
 	router.HandleFunc("/login", loginHandler).Methods("POST")
 	router.Handle("/logout", authreq{logoutHandler}).Methods("POST")
+	router.HandleFunc("/register", registerNewUserHandler).Methods("POST")
 	return router
 }
 
 //ServerResponse back to client
 type ServerResponse struct {
-	Result      string          `json:"result,omitempty"`
-	ErrResponse *ErrorResponse  `json:"err_response,omitempty"`
-	Session     *mineme.Session `json:"session,omitempty"`
-	User        *mineme.User    `json:"user,omitempty"`
+	Result  string                  `json:"result,omitempty"`
+	Details *DetailResponse         `json:"details,omitempty"`
+	Session *mineme.Session         `json:"session,omitempty"`
+	User    *mineme.SafeUserDetails `json:"user,omitempty"`
 }
 
 //ClientRequest from client
@@ -96,22 +97,25 @@ type ClientRequest struct {
 	} `json:"user,omitempty"`
 }
 
-//ErrorResponse for errors
-type ErrorResponse struct {
-	Code    code   `json:"code,omitempty"`
-	Text    string `json:"text,omitempty"`
-	Status  bool   `json:"status,omitempty"`
-	ByteArr []byte `json:"byte_arr,omitempty"`
+//DetailResponse for errors
+type DetailResponse struct {
+	Code      code   `json:"code,omitempty"`
+	Text      string `json:"text,omitempty"`
+	Status    bool   `json:"status,omitempty"`
+	ReponseID string `json:"error_id,omitempty"`
 }
 
 type code int
 
 //StatusCodes for errors
 const (
-	LOGINNOTFOUND code = 1001 + iota
+	OKAY code = 1000 + iota
+	LOGINNOTFOUND
 	LOGINREQUIRED
 	NOTLOGGEDIN
 	ALREADYLOGGEDIN
+	LOGINTAKEN
+	UNKNOWNERROR
 )
 
 //FillErrorResponse unifies responses
@@ -120,55 +124,88 @@ func FillErrorResponse(c code) *ServerResponse {
 	case LOGINREQUIRED:
 		return &ServerResponse{
 			Result: "error",
-			ErrResponse: &ErrorResponse{
-				Code:    c,
-				Text:    "You need to be logged in to proceed this action",
-				Status:  false,
-				ByteArr: md5.New().Sum([]byte("whathappenedhere??????")),
+			Details: &DetailResponse{
+				Code:      c,
+				Text:      "You need to be logged in to proceed this action",
+				Status:    false,
+				ReponseID: uuid.New().String(),
 			},
 		}
 	case NOTLOGGEDIN:
 		return &ServerResponse{
 			Result: "error",
-			ErrResponse: &ErrorResponse{
-				Code:    c,
-				Text:    "You are not logged in",
-				Status:  false,
-				ByteArr: md5.New().Sum([]byte("whathappenedhere??????")),
+			Details: &DetailResponse{
+				Code:      c,
+				Text:      "You are not logged in",
+				Status:    false,
+				ReponseID: uuid.New().String(),
 			},
 		}
 	case http.StatusBadRequest:
 		return &ServerResponse{
 			Result: "error",
-			ErrResponse: &ErrorResponse{
-				Code:    c,
-				Text:    "Something went wrong and ended with an error. Sorry.",
-				Status:  false,
-				ByteArr: md5.New().Sum([]byte("whathappenedhere??????")),
+			Details: &DetailResponse{
+				Code:      c,
+				Text:      "Something went wrong and ended with an error. Sorry.",
+				Status:    false,
+				ReponseID: uuid.New().String(),
 			},
 		}
 	case ALREADYLOGGEDIN:
 		return &ServerResponse{
 			Result: "error",
-			ErrResponse: &ErrorResponse{
-				Code:    c,
-				Text:    "You are already logged in",
-				Status:  false,
-				ByteArr: md5.New().Sum([]byte("whathappenedhere??????")),
+			Details: &DetailResponse{
+				Code:      c,
+				Text:      "You are already logged in",
+				Status:    false,
+				ReponseID: uuid.New().String(),
+			},
+		}
+	case LOGINTAKEN:
+		return &ServerResponse{
+			Result: "error",
+			Details: &DetailResponse{
+				Code:      c,
+				Text:      "Login already taken",
+				Status:    false,
+				ReponseID: uuid.New().String(),
 			},
 		}
 	default:
 		return &ServerResponse{
 			Result: "error",
-			ErrResponse: &ErrorResponse{
-				Code:    c,
-				Text:    "Bad Request",
-				Status:  false,
-				ByteArr: md5.New().Sum([]byte("whathappenedhere??????")),
+			Details: &DetailResponse{
+				Code:      c,
+				Text:      "Unknown Error",
+				Status:    false,
+				ReponseID: uuid.New().String(),
 			},
 		}
 	}
 
+}
+
+func fillGoodResponse(c code) *ServerResponse {
+	switch c {
+	case OKAY:
+		return &ServerResponse{
+			Result: "ok",
+			Details: &DetailResponse{
+				Code:   c,
+				Text:   "Success",
+				Status: true,
+			},
+		}
+	default:
+		return &ServerResponse{
+			Result: "ok",
+			Details: &DetailResponse{
+				Code:   c,
+				Text:   "Success",
+				Status: true,
+			},
+		}
+	}
 }
 
 type authreq struct {
@@ -178,25 +215,38 @@ type authreq struct {
 func (a authreq) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	session, _ := sManager.SessionStart(w, r)
 	if session == nil {
-		w.WriteHeader(http.StatusNotFound)
-		w.Header().Add("Content-Type", "application/json; encoding=utf8")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(FillErrorResponse(http.StatusBadRequest))
 		return
 	}
-	u, err := sManager.LoadUser(session)
-	logger.Println("Is there any errors during search:", err)
+	u, _ := sManager.LoadUser(session)
 	if session.UserID == uuid.Nil {
-		logger.Printf("User auth required to perform this action: %s", r.RequestURI)
-		w.WriteHeader(http.StatusNotFound)
-		w.Header().Add("Content-Type", "application/json; encoding=utf8")
+		logger.Printf("User authorization required to perform this action: %s", r.RequestURI)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(FillErrorResponse(LOGINREQUIRED))
 		return
 	}
-	logger.Printf("User %s has been logged in", u)
+	if !model.CheckUserExists("", "", u) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(FillErrorResponse(LOGINNOTFOUND))
+		return
+	}
+	model.ReadUUID(u)
+	if u.Status == mineme.USERPERMAMENTLY {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(FillErrorResponse(http.StatusForbidden))
+		return
+	}
+	logger.Println(u)
 	ctx := context.WithValue(r.Context(), mineme.SessionContext("sessionid"), session.SessionID.String())
 	r = r.WithContext(ctx)
-	logger.Println("Adding sessionid to context")
+	logger.Println("sessionid attached to request context")
 	session.Created = time.Now().Unix()
+	logger.Println("Session time has been updated")
 	a.next.ServeHTTP(w, r)
 }
 
@@ -204,143 +254,146 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	session, _ := sManager.SessionStart(w, r)
 	if session == nil {
 		logger.Println("Session is nil. That is STRANGE!")
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		w.Header().Add("Content-Type", "application/json; encoding=utf8")
 		json.NewEncoder(w).Encode(FillErrorResponse(http.StatusBadRequest))
 		return
 	}
-	// u, _ := sManager.LoadUser(session)
-	// if u.ID != uuid.Nil {
-	// 	logger.Printf("Found user: %v", u)
-	// 	w.WriteHeader(http.StatusOK)
-	// 	w.Header().Add("Content-Type", "application/json; encoding=utf8")
-	// 	json.NewEncoder(w).Encode(FillErrorResponse(ALREADYLOGGEDIN))
-	// 	return
-	// }
 	if session.UserID != uuid.Nil {
-		logger.Printf("Found user by session.UserID: %v", session.UserID)
+		logger.Printf("Session.UserID is not empty [%v]", session.UserID)
 		u := &mineme.User{ID: session.UserID}
 		if !model.CheckUserExists("", "", u) {
 			logger.Println("but this user doesn't exist")
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
-			w.Header().Add("Content-Type", "application/json; encoding=utf8")
 			json.NewEncoder(w).Encode(FillErrorResponse(LOGINNOTFOUND))
 			return
 		}
-		logger.Println("and this user exists")
+		logger.Println("and the user exists")
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Header().Add("Content-Type", "application/json; encoding=utf8")
 		json.NewEncoder(w).Encode(FillErrorResponse(ALREADYLOGGEDIN))
 		return
 	}
-	logger.Printf("Current session do not have assosiated user. Trying to authenticate current user")
-	if ctype := r.Header.Get("content-type"); ctype != "application/json" {
+	logger.Printf("Temp session doesn't have any bounded user. Authorizing.")
+	if ctype := r.Header.Get("Content-Type"); ctype != "application/json" {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		w.Header().Add("Content-Type", "application/json; encoding=utf8")
 		json.NewEncoder(w).Encode(FillErrorResponse(http.StatusBadRequest))
 		return
 	}
-	//TODO: Separate creation a new user and login new user to different pathes
-	var cresponse *ClientRequest
-	err := json.NewDecoder(r.Body).Decode(&cresponse)
-	if err != nil || cresponse == nil || cresponse.User == nil {
-		logger.Printf("Got an error trying to proceed user register: %v", err)
+
+	var resp *ClientRequest
+	err := json.NewDecoder(r.Body).Decode(&resp)
+	r.Body.Close()
+	if err != nil || resp == nil || resp.User == nil {
+		logger.Printf("Got an error trying to proceed user login: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(FillErrorResponse(http.StatusBadRequest))
+		return
+	}
+	logger.Printf("Found credentials for user %s", resp.User.Login)
+	if !model.CheckUserExists(resp.User.Login, resp.User.Password, nil) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		w.Header().Add("Content-Type", "application/json; encoding=utf8")
+		json.NewEncoder(w).Encode(FillErrorResponse(LOGINNOTFOUND))
+		return
+	}
+	encryptedPassword := md5.Sum([]byte(resp.User.Password))
+	u := &mineme.User{Login: resp.User.Login, Password: encryptedPassword}
+	err = model.AuthUser(u)
+	if err != nil {
+		logger.Printf("Can't authenticate user. Reason: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(FillErrorResponse(LOGINNOTFOUND))
+		return
+	}
+	logger.Println("User authenticated. Attaching session to this user")
+	session.UserID = u.ID
+	//I think it is a bad idea to assign new _id for the second time
+	// if session.OID == "" {
+	// 	session.OID = bson.NewObjectId()
+	// }
+	if session.OID == "" {
+		logger.Println("Session OID is empty somehow...")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(FillErrorResponse(http.StatusBadRequest))
 		return
 	}
-	logger.Printf("Found ClientRespose: %+v", *cresponse)
-	logger.Printf("Here we should handler user registration. Got credentials: %s:%s", cresponse.User.Login, cresponse.User.Password)
-	logger.Printf("Trying to authenticate user...")
-	if !model.CheckUserExists(cresponse.User.Login, cresponse.User.Password, nil) {
-		userNew, err := model.CreateNewUser(cresponse.User.Login, cresponse.User.Password, cresponse.User.FirstName, cresponse.User.LastName, cresponse.User.Age)
-		if err != nil || userNew == nil {
-			logger.Printf("Got an error trying to proceed user register: %v", err)
-			w.WriteHeader(http.StatusNotFound)
-			w.Header().Add("Content-Type", "application/json; encoding=utf8")
-			json.NewEncoder(w).Encode(FillErrorResponse(http.StatusBadRequest))
-			return
-		}
-		logger.Printf("Created new user: %v", userNew)
-		session.UserID = userNew.ID
-	} else {
-		logger.Println("Found user. Assigning session to this user")
-		encryptedPassword := md5.Sum([]byte(cresponse.User.Password))
-		u := &mineme.User{Login: cresponse.User.Login, Password: encryptedPassword}
-		model.AuthUser(u)
-		session.UserID = u.ID
+	err = sManager.CreateSession(session)
+	if err != nil {
+		logger.Println("There was an error creating session", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(FillErrorResponse(http.StatusBadRequest))
+		return
 	}
-	if session.OID == "" {
-		session.OID = bson.NewObjectId()
-	}
-	sManager.CreateSession(session)
 	logger.Printf("Session %s has been stored to the database", session.OID)
+	respQuery := fillGoodResponse(OKAY)
+	//TODO: Need to make API requests to Coinhive for user statistics retrieve.
+	respQuery.User = u.MakeSafeUser()
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Header().Add("Content-Type", "text/plain; encoding=utf8")
-	w.Write([]byte("ok"))
+	json.NewEncoder(w).Encode(respQuery)
 }
 
-func loginAuthHandler(w http.ResponseWriter, r *http.Request) {
+func registerNewUserHandler(w http.ResponseWriter, r *http.Request) {
+	session, _ := sManager.SessionStart(w, r)
 	req := &ClientRequest{}
 	err := json.NewDecoder(r.Body).Decode(req)
 	if err != nil || req.User == nil {
 		seresp := FillErrorResponse(http.StatusBadRequest)
-		seresp.ErrResponse.Text = "Bad Request"
+		seresp.Details.Text = "Bad Request"
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		w.Header().Add("Content-Type", "application/json; encoding=utf8")
 		json.NewEncoder(w).Encode(&seresp)
 		return
 	}
-	// err = model.AuthUser(req.User)
-	// if err != nil {
-	// 	w.WriteHeader(http.StatusNotFound)
-	// 	w.Header().Add("Content-Type", "application/json; encoding=utf8")
-	// 	json.NewEncoder(w).Encode(FillErrorResponse(LOGINNOTFOUND))
-	// 	return
-	// }
-	// if req.User.ID == uuid.Nil {
-	// 	req.User.ID = uuid.New()
-	// 	req.User.Age = 0
-	// 	req.User.Group = mineme.USER
-	// 	req.User.Status = mineme.USERAPPROVED
-	// 	req.User.FirstName = "Guess"
-	// 	req.User.LastName = "who?"
-	// 	model.Create(req.User)
-	// }
-	// session, _ := r.Context().Value(mineme.SessionContext("sessionid")).(string)
-	// sid, _ := uuid.Parse(session)
-	// s := &mineme.Session{
-	// 	SessionID: sid,
-	// }
-	// sManager.LoadSessionUUID(s)
-	// s.UserID = req.User.ID
-	// s.Created = time.Now().Unix()
-	// sManager.UpdateSession(s)
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+
+	userNew, err := model.CreateNewUser(req.User.Login, req.User.Password, req.User.FirstName, req.User.LastName, req.User.Age)
+	if err != nil || userNew == nil {
+		logger.Printf("Got an error trying to proceed user register: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(FillErrorResponse(http.StatusBadRequest))
+		return
+	}
+	logger.Printf("Created new user: %v", userNew)
+	session.UserID = userNew.ID
+	sManager.UpdateSession(session)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(fillGoodResponse(OKAY))
 }
 
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	// SessionContext("sessionid")
-	sessionInt := r.Context().Value(mineme.SessionContext("sessionid"))
-	session, ok := sessionInt.(string)
-	logger.Printf("Just debug info: %v %v", sessionInt, ok)
+	session, ok := r.Context().Value(mineme.SessionContext("sessionid")).(string)
 	if session == "" || !ok {
 		logger.Println("Can't retrieve session from context")
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		w.Header().Add("Content-Type", "application/json; encoding=utf8")
 		json.NewEncoder(w).Encode(FillErrorResponse(NOTLOGGEDIN))
 		return
 	}
-	logger.Println("Converting sessionid to uuid type")
-	sid, _ := uuid.Parse(session)
+	sid, err := uuid.Parse(session)
+	if err != nil {
+		logger.Println("Can't parse sessionid:", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(FillErrorResponse(http.StatusBadRequest))
+	}
 	s := &mineme.Session{SessionID: sid}
 	logger.Println("Deleting session from database")
-	err := sManager.DeleteSession(s)
+	err = sManager.DeleteSession(s)
 	if err != nil {
 		logger.Println("Can't delete session. Reason: ", err)
 	}
 	sManager.SessionEnd(w, r)
-	http.Redirect(w, r, "/", http.StatusFound)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(fillGoodResponse(OKAY))
 }

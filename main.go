@@ -1,3 +1,5 @@
+//TODO: Add processing for os.Interrupt and syscall.SIGTERM
+//TODO: Add parsable parameters from args
 package main
 
 import (
@@ -15,7 +17,6 @@ const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 const connString = "mongodb://localhost"
 
 func main() {
-	log.Println("Here will be some microservice in future")
 	c := make(chan os.Signal, 3)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	db, err := mgo.Dial(connString)
