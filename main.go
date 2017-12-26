@@ -23,6 +23,8 @@ func main() {
 		log.Fatal(err)
 	}
 	daemon.Run(":8888", db.DB("mineme"), true, os.Stdout, c)
+	<-c
+
 }
 
 func randStringBytesRmndr(n int) string {

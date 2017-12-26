@@ -1,7 +1,6 @@
 package mineme
 
 import (
-	"context"
 	"io"
 	"io/ioutil"
 	"log"
@@ -14,13 +13,14 @@ import (
 	"gopkg.in/mgo.v2/bson"
 )
 
+var smlogger *log.Logger
+
 //SessionManager manages sessions
 type SessionManager struct {
 	cookieName  string
 	maxlifetime int64
 	db          *mgo.Database
 	mux         sync.RWMutex
-	logger      *log.Logger
 }
 
 //NewSessionManager creates a new instance of SM
@@ -28,13 +28,12 @@ func NewSessionManager(db *mgo.Database, debug bool, debugW io.Writer) (*Session
 	if db == nil {
 		return nil, ErrDBIsNil
 	}
-	var logger *log.Logger
 	if !debug {
-		logger = log.New(ioutil.Discard, "", 0)
+		smlogger = log.New(ioutil.Discard, "", 0)
 	} else {
-		logger = log.New(debugW, "[SessionManager] ", log.Ldate+log.Ltime)
+		smlogger = log.New(debugW, "[SessionManager] ", log.Ldate+log.Ltime)
 	}
-	sm := &SessionManager{db: db, cookieName: "sessionid", logger: logger}
+	sm := &SessionManager{db: db, cookieName: "sessionid", maxlifetime: int64(time.Hour * 24 * 30 / 10000)}
 	sm.SessionGC()
 	return sm, nil
 }
@@ -45,35 +44,50 @@ func (s *SessionManager) sessionID() uuid.UUID {
 
 //SessionStart trying to retrieve session from cookies. If there is no cookies with session creates a new one
 func (s *SessionManager) SessionStart(w http.ResponseWriter, r *http.Request) (*Session, error) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
 	cookie, err := r.Cookie(s.cookieName)
 	if err != nil || cookie.Value == "" {
-		sid := s.sessionID()
-		sess := &Session{SessionID: sid, Lifetime: s.maxlifetime}
-		if err != nil {
-			return nil, err
-		}
-		cookie := &http.Cookie{
-			Name:   s.cookieName,
-			Value:  sid.String(),
-			Path:   "/",
-			MaxAge: int(s.maxlifetime),
-		}
-		http.SetCookie(w, cookie)
-		ctx := context.WithValue(r.Context(), SessionContext("sessionid"), sid.String())
-		r = r.WithContext(ctx)
-		return sess, nil
+		logger.Println("Cookie value is emptry")
+		session := s.assignNewSession(w, r)
+		return session, nil
 	}
-	var sess Session
-	err = s.db.C(SESSIONCOLLECTION).Find(bson.M{"id": cookie.Value}).One(&sess)
-	return &sess, err
+	logger.Printf("Found cookie with the following sessionid: %s", cookie.Value)
+	logger.Println("Parsing cookie to UUID type")
+	sUUID, err := uuid.Parse(cookie.Value)
+	if err != nil {
+		logger.Printf("Can't parse session UUID: %s", cookie.Value)
+		return nil, err
+	}
+	logger.Printf("Trying to find session id [%s]", sUUID.String())
+	session := &Session{SessionID: sUUID}
+	err = session.FindByID(s.db)
+	if err == mgo.ErrNotFound {
+		logger.Println("but session not found")
+		session := s.assignNewSession(w, r)
+		return session, nil
+	}
+	logger.Println("and session has been found:", session)
+
+	return session, nil
+}
+
+func (s *SessionManager) assignNewSession(w http.ResponseWriter, r *http.Request) *Session {
+	sid := s.sessionID()
+	smlogger.Printf("Created new sessionID: %s", sid.String())
+	sess := &Session{SessionID: sid, Lifetime: s.maxlifetime, OID: bson.NewObjectId(), Created: time.Now().Unix()}
+	cookie := &http.Cookie{
+		Name:     s.cookieName,
+		Value:    sid.String(),
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   int(s.maxlifetime),
+	}
+	smlogger.Println("Assigning cookies to client")
+	http.SetCookie(w, cookie)
+	return sess
 }
 
 //SessionEnd removes session from browser and database
 func (s *SessionManager) SessionEnd(w http.ResponseWriter, r *http.Request) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
 	cookie, err := r.Cookie(s.cookieName)
 	if err != nil || cookie.Value == "" {
 		return
@@ -86,31 +100,47 @@ func (s *SessionManager) SessionEnd(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 	}
 	http.SetCookie(w, hcookie)
-	s.db.C(SESSIONCOLLECTION).Remove(bson.M{"id": cookie.Value})
+	// s.db.C(SESSIONCOLLECTION).Remove(bson.M{"session_id": cookie.Value})
 }
 
 //SessionGC removes all expired sessions
 func (s *SessionManager) SessionGC() {
-	s.logger.Println("Garbage Collection initiated")
+	smlogger.Println("Garbage Collection started")
+	t := time.Now()
 	s.db.C(SESSIONCOLLECTION).RemoveAll(bson.M{
 		"created": bson.M{
-			"$lte": time.Now().Unix(),
+			"$lte": time.Now().Unix() - s.maxlifetime,
 		},
 	})
+	smlogger.Printf("Garbage Collection completed. Took %s", time.Since(t))
 	time.AfterFunc(time.Minute*15, s.SessionGC)
 }
 
 //UpdateSession and save changes into db
 func (s *SessionManager) UpdateSession(session *Session) error {
+	smlogger.Printf("Updating session %s", session.OID.String())
 	return session.Update(s.db)
 }
 
 //LoadSessionUUID from database by Session_ID
 func (s *SessionManager) LoadSessionUUID(session *Session) error {
+	smlogger.Printf("Loading session %s", session.SessionID.String())
 	return session.ReadUUID(s.db)
 }
 
 //DeleteSession from database
 func (s *SessionManager) DeleteSession(session *Session) error {
-	return session.Delete(s.db)
+	smlogger.Printf("Deleting session %s", session.SessionID.String())
+	return session.DeleteByID(s.db)
+}
+
+//LoadUser from database related to specified session
+func (s *SessionManager) LoadUser(session *Session) (*User, error) {
+	smlogger.Printf("Loading user (ID: %s) related to session %s", session.UserID, session.OID.String())
+	return session.User(s.db)
+}
+
+//CreateSession and store it into database
+func (s *SessionManager) CreateSession(session *Session) error {
+	return session.Create(s.db)
 }

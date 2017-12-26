@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"regexp"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"gopkg.in/mgo.v2"
@@ -33,7 +32,6 @@ type User struct {
 	Age             int           `json:"age,omitempty" bson:"age"`
 	Status          Status        `json:"status,omitempty" bson:"status"`
 	Group           Group         `json:"group,omitempty" bson:"group"`
-	Expired         time.Time     `json:"expired,omitempty" bson:"expired"`
 	Hashes          int           `json:"hashes,omitempty" bson:"hashes"`
 	AcceptedHashes  int           `json:"accepted_hashes,omitempty" bson:"accepted_hashes"`
 	PaymentsDone    int           `json:"payments_done,omitempty" bson:"payments_done"`
@@ -72,7 +70,7 @@ func (u *User) Create(db *mgo.Database) error {
 		}
 		break
 	}
-	return nil
+	return coll.Insert(u)
 }
 
 //Delete deletes user from database
@@ -87,14 +85,28 @@ func (u *User) Read(db *mgo.Database) error {
 	return db.C(USERCOLLECTION).FindId(u.OID).One(u)
 }
 
-//FindUser using user and password
-func (u *User) FindUser(db *mgo.Database) error {
+//ReadUUID reads user info from database. OID should be specified before request
+func (u *User) ReadUUID(db *mgo.Database) error {
 	u.mux.Lock()
 	defer u.mux.Unlock()
-	return db.C(USERCOLLECTION).Find(bson.M{
-		"login":    u.Login,
-		"password": u.Password,
-	}).One(&u)
+	return db.C(USERCOLLECTION).Find(bson.M{"id": u.ID.String()}).One(u)
+}
+
+//FindUser using user and password
+func (u *User) FindUser(db *mgo.Database) error {
+	// return db.C(USERCOLLECTION).Find(bson.M{
+	// 	"login":    u.Login,
+	// 	"password": u.Password,
+	// }).One(&u)
+	if bson.IsObjectIdHex(u.OID.String()) {
+		logger.Printf("Using OID to find user: %s", u.OID.String())
+		return db.C(USERCOLLECTION).FindId(u.OID).Limit(1).One(u)
+	} else if u.ID != uuid.Nil {
+		logger.Printf("Using UUID to find user: %s", u.ID.String())
+		return db.C(USERCOLLECTION).Find(bson.M{"id": u.ID}).Limit(1).One(u)
+	}
+	logger.Printf("Using login & password to find user: %s", u.Login)
+	return db.C(USERCOLLECTION).Find(bson.M{"login": u.Login, "password": u.Password}).Limit(1).One(u)
 }
 
 //Errors handling
@@ -104,9 +116,12 @@ var (
 )
 
 //NewUser creates a new user
-func NewUser(FirstName, LastName, Password, Login string, Age int, Group Group, Status Status, Expired time.Time, db *mgo.Database) (*User, error) {
+func NewUser(FirstName, LastName, Login, Password string, Age int, Group Group, Status Status, db *mgo.Database) (*User, error) {
 	if db == nil {
 		return nil, ErrDBIsNil
+	}
+	if !checkNames.MatchString(FirstName) || !checkNames.MatchString(LastName) {
+		return nil, fmt.Errorf("FirstName or LastName error: %s %s", FirstName, LastName)
 	}
 	if !checkNames.MatchString(FirstName) || !checkNames.MatchString(LastName) ||
 		!checkPassword.MatchString(Password) || !checkLogin.MatchString(Login) ||
@@ -120,18 +135,39 @@ func NewUser(FirstName, LastName, Password, Login string, Age int, Group Group, 
 	encryptedPassword := md5.Sum([]byte(Password))
 	u := &User{
 		OID:       bson.NewObjectId(),
+		Login:     Login,
 		ID:        uuid.New(),
 		FirstName: FirstName,
 		LastName:  LastName,
 		Password:  encryptedPassword,
 		Age:       Age,
 		Group:     Group,
-		Expired:   Expired,
 	}
 	if err := u.Create(db); err != nil {
 		return nil, err
 	}
 	return u, nil
+}
+
+//IsExist checks if user exist or not
+func (u *User) IsExist(db *mgo.Database) bool {
+	var n int
+	var err error
+	if bson.IsObjectIdHex(u.OID.String()) {
+		logger.Printf("Using OID to find user: %s", u.OID.String())
+		n, err = db.C(USERCOLLECTION).FindId(u.OID).Limit(1).Count()
+	} else if u.ID != uuid.Nil {
+		logger.Printf("Using UUID to find user: %s", u.ID.String())
+		n, err = db.C(USERCOLLECTION).Find(bson.M{"id": u.ID}).Limit(1).Count()
+	} else {
+		logger.Printf("Using login & password to find user: %s", u.Login)
+		n, err = db.C(USERCOLLECTION).Find(bson.M{"login": u.Login, "password": u.Password}).Limit(1).Count()
+	}
+
+	if err != nil || n == 0 {
+		return false
+	}
+	return true
 }
 
 //Status describes the status of the account

@@ -3,6 +3,8 @@ package mineme
 import (
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 )
 
 var _ CRUD = (*Session)(nil)
+var slogger = log.New(os.Stdout, "[Session] ", log.Ldate+log.Ltime)
 
 //SessionContext stores data for context
 type SessionContext string
@@ -21,11 +24,11 @@ const SESSIONCOLLECTION = "sessions"
 
 //Session describes the current session from the browser.
 type Session struct {
-	OID       bson.ObjectId `json:"-,omitempty" mgo:"_oid"`
-	SessionID uuid.UUID     `json:"session_id,omitempty" mgo:"session_id"`
-	UserID    uuid.UUID     `json:"user_id,omitempty" mgo:"user_id"`
-	Lifetime  int64
-	Created   int64
+	OID       bson.ObjectId `json:"-,omitempty" bson:"_id"`
+	SessionID uuid.UUID     `json:"session_id,omitempty" bson:"session_id"`
+	UserID    uuid.UUID     `json:"user_id,omitempty" bson:"user_id"`
+	Lifetime  int64         `json:"lifetime,omitempty" bson:"lifetime"`
+	Created   int64         `json:"created,omitempty" bson:"created"`
 	mux       sync.RWMutex
 	user      *User
 }
@@ -56,12 +59,10 @@ func NewSession(userid uuid.UUID, Lifetime int64, db *mgo.Database) (*Session, e
 }
 
 func (s *Session) String() string {
-	s.mux.Lock()
-	defer s.mux.Unlock()
 	if s.Created+s.Lifetime < time.Now().Unix() {
-		return fmt.Sprintf("Session [%s] is expired", s.SessionID)
+		return fmt.Sprintf("Session [%s] is expired: Created: %d; Lifetime: %d", s.SessionID, s.Created, s.Lifetime)
 	}
-	return fmt.Sprintf("Session [%s]. Expiration date: %s", s.SessionID, time.Unix(s.Created+s.Lifetime, 0))
+	return fmt.Sprintf("Session [%s] for user [%s]. Created: %d; Lifetime: %d. Expiration date: %s", s.SessionID, s.UserID, s.Created, s.Lifetime, time.Unix(s.Created+s.Lifetime, 0))
 }
 
 //Create a new session and upload it to database
@@ -78,27 +79,27 @@ func (s *Session) Create(db *mgo.Database) error {
 		}
 		break
 	}
-	return nil
+	slogger.Printf("Creating session: %v", s)
+	return db.C(SESSIONCOLLECTION).Insert(s)
 }
 
 //Read a specified session from database
 func (s *Session) Read(db *mgo.Database) error {
-	s.mux.Lock()
-	defer s.mux.Unlock()
 	return db.C(SESSIONCOLLECTION).FindId(s.OID).One(s)
+}
+
+//FindByID session from database
+func (s *Session) FindByID(db *mgo.Database) error {
+	return db.C(SESSIONCOLLECTION).Find(bson.M{"session_id": s.SessionID}).One(s)
 }
 
 //ReadUUID read from database with specified SessionID
 func (s *Session) ReadUUID(db *mgo.Database) error {
-	s.mux.Lock()
-	defer s.mux.Unlock()
-	return db.C(SESSIONCOLLECTION).Find(bson.M{"session_id": s.SessionID.String()}).One(s)
+	return db.C(SESSIONCOLLECTION).Find(bson.M{"session_id": s.SessionID}).One(s)
 }
 
 //Update current session at the backend server and in the database
 func (s *Session) Update(db *mgo.Database) error {
-	s.mux.Lock()
-	defer s.mux.Unlock()
 	if db == nil {
 		return ErrDBIsNil
 	}
@@ -110,13 +111,16 @@ func (s *Session) Delete(db *mgo.Database) error {
 	return db.C(SESSIONCOLLECTION).RemoveId(s.OID)
 }
 
+//DeleteByID session from database
+func (s *Session) DeleteByID(db *mgo.Database) error {
+	return db.C(SESSIONCOLLECTION).Remove(bson.M{"session_id": s.SessionID})
+}
+
 //User retrieves user from database assosiated with current session
 func (s *Session) User(db *mgo.Database) (*User, error) {
-	if s.user != nil {
-		return s.user, nil
-	}
 	u := &User{ID: s.UserID}
-	err := db.C(USERCOLLECTION).Find(bson.M{"id": u}).One(u)
-	s.user = u
+	err := u.FindUser(db)
+	// err := db.C(USERCOLLECTION).Find(bson.M{"id": u}).One(u)
+	// s.user = u
 	return u, err
 }
